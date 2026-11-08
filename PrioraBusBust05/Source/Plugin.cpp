@@ -6,221 +6,384 @@
 
 using APVTS = juce::AudioProcessorValueTreeState;
 
-class PrioraBusProcessor final : public juce::AudioProcessor
+class PrioraProcessor final : public juce::AudioProcessor
 {
 public:
-    PrioraBusProcessor()
-      : AudioProcessor(BusesProperties().withInput("Input", juce::AudioChannelSet::stereo(), true)
-                                           .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-        state(*this, nullptr, "PRIORA", makeLayout()) {}
+    PrioraProcessor()
+      : AudioProcessor(BusesProperties()
+          .withInput("Input", juce::AudioChannelSet::stereo(), true)
+          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+        state(*this, nullptr, "PRIORA_BUS_BUST05", makeParameters()) {}
 
     APVTS state;
-    static APVTS::ParameterLayout makeLayout()
+
+    static APVTS::ParameterLayout makeParameters()
     {
         APVTS::ParameterLayout p;
-        auto add=[&p](const char* id, const char* label,float minimum,float maximum,float step,float def)
-        {p.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{id,1},label,
-                                juce::NormalisableRange<float>{minimum,maximum,step},def));};
-        add("boost","Bass Boost (dB)",0,24,0.1f,12);
-        add("frequency","Low End (Hz)",30,200,1,65);
-        add("bust","Bust / Distortion",0,100,1,55);
-        add("mix","Dry Wet (%)",0,100,1,100);
+        auto parameter = [&p](const char* id, const char* title,
+                              float min, float max, float step, float initial)
+        {
+            p.add(std::make_unique<juce::AudioParameterFloat>(
+              juce::ParameterID{id, 1}, title,
+              juce::NormalisableRange<float>{min, max, step}, initial));
+        };
+        parameter("boost", "Bass Boost (dB)", 0.f, 24.f, .1f, 12.f);
+        parameter("frequency", "Low End (Hz)", 30.f, 200.f, 1.f, 65.f);
+        parameter("bust", "Bust / Distortion (%)", 0.f, 100.f, 1.f, 55.f);
+        parameter("mix", "Wet Mix (%)", 0.f, 100.f, 1.f, 100.f);
         p.add(std::make_unique<juce::AudioParameterChoice>(
-              juce::ParameterID{"mode",1},"Bass Mode",
-              juce::StringArray{"Stock","Priora","Street","Max"},1));
+             juce::ParameterID{"mode", 1}, "Mode",
+             juce::StringArray{"Stock", "Priora", "Street", "Max"}, 1));
         return p;
     }
-
     float value(const char* id) const
-    {if(auto* p=state.getRawParameterValue(id))return p->load();return 0.f;}
-
-    void change(const char* id,float value)
-    {if(auto* p=state.getParameter(id))p->setValueNotifyingHost(p->convertTo0to1(value));}
-
-    void selectMode(int index)
     {
-        change("mode",(float)index);
-        switch(index)
+        if(auto* v = state.getRawParameterValue(id))
+            return v->load(std::memory_order_relaxed);
+        return 0.f;
+    }
+    void setParameter(const char* id, float v)
+    {
+        if (auto* p = state.getParameter(id))
+            p->setValueNotifyingHost(p->convertTo0to1(v));
+    }
+    void selectMode(int mode)
+    {
+        mode = juce::jlimit(0, 3, mode);
+        setParameter("mode", (float)mode);
+        switch (mode)
         {
-        case 0: change("boost",0);change("frequency",65);change("bust",0);break;
-        case 1: change("boost",12);change("frequency",65);change("bust",55);break;
-        case 2: change("boost",16);change("frequency",75);change("bust",72);break;
-        default:change("boost",22);change("frequency",88);change("bust",92);break;
+            case 0: setParameter("boost", 0);  setParameter("bust", 0); setParameter("frequency", 65); break;
+            case 1: setParameter("boost", 12); setParameter("bust", 55); setParameter("frequency", 65); break;
+            case 2: setParameter("boost", 16); setParameter("bust", 74); setParameter("frequency", 80); break;
+            case 3: setParameter("boost", 22); setParameter("bust", 93); setParameter("frequency", 95); break;
         }
     }
 
-    void prepareToPlay(double sr,int blockSize) override
+    void prepareToPlay(double newSampleRate, int) override
     {
-        sampleRate=juce::jmax(1.0,sr);
-        juce::dsp::ProcessSpec spec{sampleRate,(juce::uint32)juce::jmax(1,blockSize),1};
-        for(auto& f:shelf){f.prepare(spec);f.reset();}
-        for(auto& f:low){f.prepare(spec);f.reset();}
-        juce::ignoreUnused(blockSize);
+        sr = juce::jmax(8000.0, newSampleRate);
+        for (auto& c: channels) c = {};
     }
-    void releaseResources() override
-    {for(auto& f:shelf)f.reset(); for(auto& f:low)f.reset();}
+    void releaseResources() override { for(auto& c: channels) c = {}; }
+    bool isBusesLayoutSupported(const BusesLayout& b) const override
+    {
+        auto out = b.getMainOutputChannelSet();
+        return (out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo())
+            && b.getMainInputChannelSet() == out;
+    }
 
-    bool isBusesLayoutSupported(const BusesLayout& l) const override
-    {
-        const auto a=l.getMainOutputChannelSet();
-        return (a==juce::AudioChannelSet::mono()||a==juce::AudioChannelSet::stereo())
-              && l.getMainInputChannelSet()==a;
-    }
-    void processBlock(juce::AudioBuffer<float>& buffer,juce::MidiBuffer&) override
+    void processBlock(juce::AudioBuffer<float>& audio, juce::MidiBuffer&) override
     {
         juce::ScopedNoDenormals noDenormals;
-        const float boost=value("boost"),freq=value("frequency"),bust=value("bust")/100.f,
-                    wetMix=value("mix")/100.f;
-        const int mode=(int)std::round(value("mode"));
-        const float effectiveBoost=(mode==0?0.f:boost);
-        const float distAmount=(mode==0?0.f:bust);
-        const float gain=std::pow(10.f,effectiveBoost/20.f);
-        const float safeGain=std::pow(10.f,-effectiveBoost*.26f/20.f);
-        const float drive=1.f+distAmount*18.f;
-        const float blend=(0.14f+0.72f*distAmount);
-        const float corner=juce::jlimit(30.f,200.f,freq);
-        auto ls=juce::dsp::IIR::Coefficients<float>::makeLowShelf(sampleRate,corner,.72f,gain);
-        auto lp=juce::dsp::IIR::Coefficients<float>::makeLowPass(sampleRate,juce::jmin(260.f,corner*1.75f),.707f);
-        for(int ch=0;ch<juce::jmin(2,buffer.getNumChannels());++ch)
+        const int count = juce::jmin(audio.getNumChannels(), 2);
+        if(count == 0) return;
+        const float mix = juce::jlimit(0.f, 1.f, value("mix") * .01f);
+        if(mix <= 0.00001f) return;
+        const float boostDB = value("boost");
+        const float drive = value("bust") * .01f;
+        const float gain = std::pow(10.f, boostDB / 20.f);
+        const float freq = juce::jlimit(30.f, 200.f, value("frequency"));
+        const float a = 1.f - std::exp(-2.f * juce::MathConstants<float>::pi * freq / (float)sr);
+        if(boostDB < .001f && drive < .001f) return;
+
+        // True low-frequency enhancement: two-pole low pass + added bass
+        // with controlled low-frequency waveshaping. No graphic is used for DSP.
+        const float satDrive = 1.f + drive * 13.f;
+        const float satAmount = .78f * drive;
+        const float trim = std::pow(10.f, -boostDB * .30f / 20.f);
+        const float normaliser = std::tanh(1.2f);
+        for(int ch = 0; ch < count; ++ch)
         {
-            *shelf[(size_t)ch].coefficients=*ls;
-            *low[(size_t)ch].coefficients=*lp;
-            float* samples=buffer.getWritePointer(ch);
-            for(int i=0;i<buffer.getNumSamples();++i)
+            auto* p = audio.getWritePointer(ch);
+            auto& c = channels[(size_t)ch];
+            for(int i = 0; i < audio.getNumSamples(); ++i)
             {
-                float dry=samples[i];
-                float boosted=shelf[(size_t)ch].processSample(dry);
-                float bass=low[(size_t)ch].processSample(boosted);
-                float dirty=std::tanh(bass*drive)/(1.f+.12f*drive);
-                float x=boosted + (dirty-bass)*blend;
-                x *= safeGain;
-                // Peak protection with a continuously differentiable tanh soft clip.
-                x = std::tanh(x*1.35f)/1.35f;
-                samples[i]=juce::jlimit(-1.f,1.f,dry*(1.f-wetMix)+x*wetMix);
+                const float original = p[i];
+                c.lp1 += a * (original - c.lp1);
+                c.lp2 += a * (c.lp1 - c.lp2);
+                const float low = c.lp2;
+                const float addedBass = low * (gain - 1.f);
+                const float boosted = original + addedBass;
+                const float driven = std::tanh(low * satDrive);
+                const float harmonic = (driven - low) * satAmount;
+                const float wet = (boosted + harmonic) * trim;
+                // Soft-ceiling limits peaks generated by large bass boosts.
+                const float limited = .95f * std::tanh(wet / .95f);
+                float result = original * (1.f - mix) + limited * mix;
+                if(!std::isfinite(result)) result = 0.f;
+                p[i] = juce::jlimit(-1.f, 1.f, result);
             }
         }
+        juce::ignoreUnused(normaliser);
     }
+
+    bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override;
-    bool hasEditor() const override{return true;}
-    const juce::String getName() const override{return JucePlugin_Name;}
-    bool acceptsMidi() const override{return false;}
-    bool producesMidi() const override{return false;}
-    bool isMidiEffect() const override{return false;}
-    double getTailLengthSeconds() const override{return 0;}
-    int getNumPrograms() override{return 1;}
-    int getCurrentProgram() override{return 0;}
-    void setCurrentProgram(int) override{}
-    const juce::String getProgramName(int) override{return {};}
-    void changeProgramName(int,const juce::String&) override{}
-    void getStateInformation(juce::MemoryBlock& dst) override
-    {if(auto xml=state.copyState().createXml())copyXmlToBinary(*xml,dst);}
-    void setStateInformation(const void* data,int bytes) override
-    {if(auto xml=getXmlFromBinary(data,bytes))if(xml->hasTagName(state.state.getType()))
-        state.replaceState(juce::ValueTree::fromXml(*xml));}
+    const juce::String getName() const override { return JucePlugin_Name; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int,const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock& data) override
+    {
+        if(auto xml = state.copyState().createXml())
+            copyXmlToBinary(*xml, data);
+    }
+    void setStateInformation(const void* data, int size) override
+    {
+        if(auto xml = getXmlFromBinary(data,size))
+            if(xml->hasTagName(state.state.getType()))
+                state.replaceState(juce::ValueTree::fromXml(*xml));
+    }
 private:
-    double sampleRate=44100;
-    std::array<juce::dsp::IIR::Filter<float>,2> shelf,low;
+    struct Channel { float lp1 = 0.f, lp2 = 0.f; };
+    std::array<Channel, 2> channels{};
+    double sr = 44100.;
 };
 
-class PrioraBusEditor final : public juce::AudioProcessorEditor, private juce::Timer
+class PrioraLookAndFeel final: public juce::LookAndFeel_V4
 {
 public:
-    explicit PrioraBusEditor(PrioraBusProcessor& p):AudioProcessorEditor(&p),processor(p)
+    void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
+                          float position, float startAngle, float endAngle,
+                          juce::Slider&) override
     {
-        art=juce::ImageCache::getFromMemory(BinaryData::background_jpg,BinaryData::background_jpgSize);
-        setSize(960,640);
-        startTimerHz(25);
-    }
-    void resized() override {}
-    void paint(juce::Graphics& g) override
-    {
-        if(art.isValid())g.drawImage(art,getLocalBounds().toFloat());
-        else g.fillAll(juce::Colour(0xff09090b));
-        // Real-time overlay keeps controls responsive while retaining the approved image.
-        const float scaleX=getWidth()/1536.f,scaleY=getHeight()/1024.f;
-        g.saveState();
-        g.addTransform(juce::AffineTransform::scale(scaleX,scaleY));
-        auto overwrite=[&](juce::Rectangle<float> rect,const juce::String& text,int fontSize, juce::Justification justification)
+        const float cx = x + width * .5f;
+        const float cy = y + height * .5f;
+        const float size = (float)juce::jmin(width, height);
+        const float radius = size * .41f;
+        const float angle = startAngle + position * (endAngle-startAngle);
+        const auto red = juce::Colour(0xfffa2833);
+        const auto muted = juce::Colour(0xff31343a);
+        // Distinct discrete scale marks, red active sector
+        for(int i=0;i<=48;++i)
         {
-            g.setColour(juce::Colour(0xff121216));
-            g.fillRoundedRectangle(rect,6.f);
-            g.setColour(juce::Colour(0xfff4f5f7));
-            g.setFont(juce::Font(juce::FontOptions((float)fontSize,juce::Font::bold)));
-            g.drawText(text,rect,justification,true);
-        };
-        overwrite({109.f,624.f,330.f,69.f},"+"+juce::String(processor.value("boost"),1)+" dB",48,juce::Justification::centred);
-        overwrite({1059.f,624.f,285.f,69.f},juce::String((int)processor.value("frequency"))+" Hz",47,juce::Justification::centred);
-        overwrite({700.f,784.f,141.f,35.f},juce::String((int)processor.value("bust"))+"%",28,juce::Justification::centred);
-        overwrite({1389.f,900.f,95.f,52.f},juce::String((int)processor.value("mix"))+"%",35,juce::Justification::centred);
-        const float boost=processor.value("boost")/24.f;
-        const float freq=(processor.value("frequency")-30.f)/170.f;
-        const float mix=processor.value("mix")/100.f;
-        auto bar=[&](float x,float y,float len,float progress)
-        {
-            g.setColour(juce::Colour(0xff111114));g.fillRoundedRectangle(x,y,len,16.f,8);
-            g.setColour(juce::Colour(0xffff1626));g.fillRoundedRectangle(x,y,juce::jmax(4.f,len*progress),16.f,8);
-            g.setColour(juce::Colours::white.withAlpha(.85f));
-            g.fillEllipse(juce::jlimit(x,x+len,x+len*progress)-8.f,y-6.f,28.f,28.f);
-        };
-        bar(108.f,720.f,405.f,boost);
-        bar(1043.f,720.f,396.f,freq);
-        bar(1037.f,916.f,360.f,mix);
-        const int mode=(int)processor.value("mode");
-        const float x[]={179.f,345.f,516.f,685.f};
-        g.setColour(juce::Colour(0xffff2335));
-        g.drawRoundedRectangle(x[juce::jlimit(0,3,mode)],899.f,151.f,48.f,7.f,3);
-        g.restoreState();
-    }
-    void mouseDown(const juce::MouseEvent& e) override
-    {
-        const auto p=toArt(e.position); dragStart=p; initialBust=processor.value("bust");
-        active=hit(p);
-        if(active==4)
-        {
-            int mode=juce::jlimit(0,3,(int)((p.x-179)/168.f));
-            if(p.x>=179&&p.x<=836)processor.selectMode(mode);
-            active=0;
+            float k = (float)i/48.f;
+            float a = startAngle + k*(endAngle-startAngle);
+            float r1=radius+17.f, r2=radius+(i%6==0?29.f:23.f);
+            g.setColour(k <= position + .001f ? red.withAlpha(.95f): muted);
+            g.drawLine(cx + std::sin(a)*r1,cy - std::cos(a)*r1,
+                       cx + std::sin(a)*r2,cy - std::cos(a)*r2,
+                       i%6==0 ? 2.f:1.f);
         }
-        else if(active>=1&&active<=3)apply(p);
-        else if(active==5)apply(p);
+        juce::Path outerArc;
+        outerArc.addCentredArc(cx,cy,radius+7,radius+7,0.f,startAngle,endAngle,true);
+        g.setColour(juce::Colour(0xff282b31));
+        g.strokePath(outerArc,juce::PathStrokeType(7.f,juce::PathStrokeType::curved));
+        juce::Path currentArc;
+        currentArc.addCentredArc(cx,cy,radius+7,radius+7,0.f,startAngle,angle,true);
+        g.setColour(red.withAlpha(.95f));
+        g.strokePath(currentArc,juce::PathStrokeType(7.f,juce::PathStrokeType::curved));
+
+        g.setColour(juce::Colours::black.withAlpha(.8f));
+        g.fillEllipse(cx-radius+3,cy-radius+7,2*radius,2*radius);
+        g.setGradientFill(juce::ColourGradient(
+           juce::Colour(0xff4a4d54),cx-radius,cy-radius,
+           juce::Colour(0xff090b10),cx+radius,cy+radius,false));
+        g.fillEllipse(cx-radius,cy-radius,2*radius,2*radius);
+        g.setColour(juce::Colour(0xff696e77));
+        g.drawEllipse(cx-radius,cy-radius,2*radius,2*radius,2.f);
+        g.setColour(juce::Colour(0xff121419));
+        g.drawEllipse(cx-radius+10,cy-radius+10,2*(radius-10),2*(radius-10),2.f);
+        g.setColour(juce::Colours::white.withAlpha(.065f));
+        g.fillEllipse(cx-radius+17,cy-radius+17,2*(radius-17),2*(radius-17));
+
+        // Moving pointer is DRAWN from the live parameter value, not a photo
+        float r0=radius*.28f, r1=radius*.79f;
+        g.setColour(juce::Colour(0xfffff2ea));
+        g.drawLine(cx+std::sin(angle)*r0,cy-std::cos(angle)*r0,
+                   cx+std::sin(angle)*r1,cy-std::cos(angle)*r1,5.f);
+        g.setColour(red);
+        g.fillEllipse(cx-4,cy-4,8,8);
     }
-    void mouseDrag(const juce::MouseEvent& e) override
+
+    void drawLinearSlider(juce::Graphics& g,int x,int y,int w,int h,float sliderPos,
+                          float, float, const juce::Slider::SliderStyle style,
+                          juce::Slider& slider) override
     {
-        if(active==0)return;
-        apply(toArt(e.position));
-    }
-    void mouseUp(const juce::MouseEvent&) override{active=0;}
-private:
-    juce::Point<float> toArt(juce::Point<float> p) const
-    {return {p.x*1536.f/getWidth(),p.y*1024.f/getHeight()};}
-    int hit(juce::Point<float> p) const
-    {
-        if(p.y>860&&p.y<980&&p.x>140&&p.x<845)return 4;
-        if(p.x>1000&&p.x<1500&&p.y>850&&p.y<985)return 5;
-        if(p.x>970&&p.x<1510&&p.y>550&&p.y<830)return 2;
-        if(p.x>55&&p.x<565&&p.y>550&&p.y<830)return 1;
-        if(p.x>550&&p.x<980&&p.y>475&&p.y<870)return 3;
-        return 0;
-    }
-    void apply(juce::Point<float> p)
-    {
-        switch(active)
+        if(style!=juce::Slider::LinearHorizontal)
         {
-            case 1:processor.change("boost",juce::jlimit(0.f,24.f,(p.x-108.f)/405.f*24.f));break;
-            case 2:processor.change("frequency",juce::jlimit(30.f,200.f,30.f+(p.x-1043.f)/396.f*170.f));break;
-            case 3:processor.change("bust",juce::jlimit(0.f,100.f,initialBust+(dragStart.y-p.y)*.55f));break;
-            case 5:processor.change("mix",juce::jlimit(0.f,100.f,(p.x-1037.f)/360.f*100.f));break;
-            default:break;
+            LookAndFeel_V4::drawLinearSlider(g,x,y,w,h,sliderPos,0,0,style,slider);
+            return;
         }
-        repaint();
+        const float middle = y+h*.5f;
+        const float left = x+12.f, right = x+w-12.f;
+        const float end = juce::jlimit(left,right,sliderPos);
+        g.setColour(juce::Colour(0xff353943));
+        g.fillRoundedRectangle(left,middle-5,right-left,10,5);
+        g.setColour(juce::Colour(0xfffa2833));
+        g.fillRoundedRectangle(left,middle-5,juce::jmax(2.f,end-left),10,5);
+        g.setColour(juce::Colour(0xffe4ebf0));
+        g.fillEllipse(end-11,middle-11,22,22);
+        g.setColour(juce::Colour(0xffb20b16));
+        g.drawEllipse(end-11,middle-11,22,22,2);
     }
-    void timerCallback() override{repaint();}
-    PrioraBusProcessor& processor;
-    juce::Image art;
-    int active=0;
-    float initialBust=55.f;
-    juce::Point<float> dragStart;
+    void drawButtonBackground(juce::Graphics& g,juce::Button& b,
+                              const juce::Colour&,bool hover,bool down) override
+    {
+        const bool chosen = b.getToggleState();
+        const auto rect=b.getLocalBounds().toFloat().reduced(1.f);
+        g.setColour(chosen?juce::Colour(0xff7c0c15):juce::Colour(0xff15171d));
+        g.fillRoundedRectangle(rect,7.f);
+        g.setColour(chosen?juce::Colour(0xffff3847):
+                     (hover?juce::Colour(0xff9ca4b4):juce::Colour(0xff393f49)));
+        g.drawRoundedRectangle(rect,7.f,chosen?2.4f:1.1f);
+        if(down) {g.setColour(juce::Colours::white.withAlpha(.12f));g.fillRoundedRectangle(rect,7.f);}
+    }
+    void drawButtonText(juce::Graphics& g,juce::TextButton& b,bool,bool) override
+    {
+        g.setColour(b.getToggleState()?juce::Colours::white:juce::Colour(0xffc3cad4));
+        g.setFont(juce::Font(juce::FontOptions(15.f,juce::Font::bold)));
+        g.drawText(b.getButtonText(),b.getLocalBounds(),juce::Justification::centred);
+    }
 };
 
-juce::AudioProcessorEditor* PrioraBusProcessor::createEditor(){return new PrioraBusEditor(*this);}
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new PrioraBusProcessor();}
+class PrioraEditor final: public juce::AudioProcessorEditor, private juce::Timer
+{
+public:
+    explicit PrioraEditor(PrioraProcessor& p): AudioProcessorEditor(&p), proc(p)
+    {
+        car = juce::ImageCache::getFromMemory(BinaryData::car_jpg,BinaryData::car_jpgSize);
+        setLookAndFeel(&skin);
+        const char* ids[] = {"boost","bust","frequency","mix"};
+        const float defaults[] = {12.f,55.f,65.f,100.f};
+        for(int i=0;i<4;++i)
+        {
+            auto& s=controls[(size_t)i];
+            s.setSliderStyle(i==3?juce::Slider::LinearHorizontal:juce::Slider::RotaryHorizontalVerticalDrag);
+            s.setTextBoxStyle(juce::Slider::NoTextBox,false,0,0);
+            s.setMouseDragSensitivity(280);
+            s.setDoubleClickReturnValue(true,defaults[i]);
+            s.setScrollWheelEnabled(true);
+            addAndMakeVisible(s);
+            attaches[(size_t)i]=std::make_unique<APVTS::SliderAttachment>(p.state,ids[i],s);
+        }
+        const char* modes[] = {u8"СТОК",u8"ПРИОРА",u8"УЛИЦА",u8"МАКС"};
+        for(int i=0;i<4;++i)
+        {
+            modesUI[(size_t)i].setButtonText(juce::String::fromUTF8(modes[i]));
+            modesUI[(size_t)i].onClick=[this,i]{proc.selectMode(i);syncUI();};
+            addAndMakeVisible(modesUI[(size_t)i]);
+        }
+        for(auto& v:values)
+        {
+            v.setJustificationType(juce::Justification::centred);
+            v.setColour(juce::Label::textColourId,juce::Colour(0xfff1f1f5));
+            v.setFont(juce::Font(juce::FontOptions(25.f,juce::Font::bold)));
+            addAndMakeVisible(v);
+        }
+        setSize(1160,780);
+        syncUI();
+        startTimerHz(20);
+    }
+    ~PrioraEditor() override {setLookAndFeel(nullptr);}
+    void resized() override
+    {
+        controls[0].setBounds(103,442,188,175);   // Bass
+        controls[1].setBounds(486,432,188,185);   // Bust
+        controls[2].setBounds(867,442,188,175);   // Low end
+        controls[3].setBounds(895,711,192,45);   // Mix
+        values[0].setBounds(78,617,240,40);
+        values[1].setBounds(462,617,240,40);
+        values[2].setBounds(850,617,224,40);
+        values[3].setBounds(1086,713,60,38);
+        for(int i=0;i<4;++i)
+            modesUI[(size_t)i].setBounds(146+i*147,706,132,47);
+    }
+    void paint(juce::Graphics& g) override
+    {
+        const auto red=juce::Colour(0xfff12b3e);
+        const auto pale=juce::Colour(0xffe9edf4);
+        const auto dim=juce::Colour(0xff9298a4);
+        g.fillAll(juce::Colour(0xff090b10));
+        auto panel=[&](juce::Rectangle<float> r,float rad)
+        {
+            g.setGradientFill(juce::ColourGradient(
+               juce::Colour(0xff1b1e25),r.getX(),r.getY(),
+               juce::Colour(0xff101116),r.getRight(),r.getBottom(),false));
+            g.fillRoundedRectangle(r,rad);
+            g.setColour(juce::Colour(0xff383b43));
+            g.drawRoundedRectangle(r,rad,1.3f);
+        };
+        panel({20,17,1120,343},14);
+        // CAR PHOTO ONLY. All lettering and all control hardware are native vector graphics.
+        if(car.isValid())
+        {
+            g.saveState();
+            g.reduceClipRegion(juce::Rectangle<int>(464,27,660,320));
+            g.drawImageWithin(car,466,27,657,320,juce::RectanglePlacement::centred | juce::RectanglePlacement::onlyReduceInSize);
+            g.restoreState();
+        }
+        g.setColour(juce::Colour(0xff0a0b10).withAlpha(.70f));
+        g.fillRect(21,20,452,337);
+        g.setColour(red);g.fillRoundedRectangle(49.f,255.f,378.f,3.f,1.5f);
+        g.setColour(pale);
+        g.setFont(juce::Font(juce::FontOptions(58.f,juce::Font::bold)));
+        g.drawText("PRIORA",49,77,399,77,juce::Justification::centredLeft);
+        g.setFont(juce::Font(juce::FontOptions(43.f,juce::Font::bold)));
+        g.drawText("BUS BUST",51,161,283,52,juce::Justification::centredLeft);
+        g.setColour(red);
+        g.drawText("05",329,161,93,52,juce::Justification::centredLeft);
+        g.setFont(juce::Font(juce::FontOptions(20.f,juce::Font::bold)));
+        g.setColour(pale);
+        g.drawText(juce::String::fromUTF8(u8"by DJ МАТЬ ЕГО БЕГЕМОТ"),52,275,415,34,juce::Justification::centredLeft);
+        g.setColour(dim);
+        g.setFont(juce::Font(juce::FontOptions(12.f)));
+        g.drawText("LOW-END DRIVE  /  SUB BASS DISTORTION  /  VST3",52,317,405,20,juce::Justification::centredLeft);
+
+        panel({20,376,358,294},14);
+        panel({401,376,358,294},14);
+        panel({782,376,358,294},14);
+        panel({20,689,1120,71},12);
+        g.setColour(red);g.fillRoundedRectangle(42.f,396.f,8.f,8.f,2.f);
+        g.fillRoundedRectangle(422.f,396.f,8.f,8.f,2.f);
+        g.fillRoundedRectangle(805.f,396.f,8.f,8.f,2.f);
+        g.setColour(pale);
+        g.setFont(juce::Font(juce::FontOptions(18.f,juce::Font::bold)));
+        g.drawText("BASS BOOST",59,386,275,27,juce::Justification::centredLeft);
+        g.drawText("BUST  /  SATURATION",439,386,280,27,juce::Justification::centredLeft);
+        g.drawText("LOW END  /  FREQ",822,386,272,27,juce::Justification::centredLeft);
+        g.setColour(dim);
+        g.setFont(juce::Font(juce::FontOptions(12.f)));
+        g.drawText("0 dB",70,637,85,24,juce::Justification::centredLeft);
+        g.drawText("+24 dB",303,637,60,24,juce::Justification::centredRight);
+        g.drawText("SOFT",414,637,75,24,juce::Justification::centredLeft);
+        g.drawText("DIRTY",698,637,50,24,juce::Justification::centredRight);
+        g.drawText("30 Hz",795,637,70,24,juce::Justification::centredLeft);
+        g.drawText("200 Hz",1069,637,59,24,juce::Justification::centredRight);
+        g.setColour(dim);
+        g.setFont(juce::Font(juce::FontOptions(14.f,juce::Font::bold)));
+        g.drawText("BASS MODE",38,714,104,28,juce::Justification::centredLeft);
+        g.drawText("MIX",828,715,62,25,juce::Justification::centredLeft);
+        g.setColour(juce::Colour(0xff383b43)); g.drawVerticalLine(812,699,749);
+    }
+
+private:
+    void syncUI()
+    {
+        values[0].setText("+"+juce::String(proc.value("boost"),1)+" dB",juce::dontSendNotification);
+        values[1].setText(juce::String((int)proc.value("bust"))+" %",juce::dontSendNotification);
+        values[2].setText(juce::String((int)proc.value("frequency"))+" Hz",juce::dontSendNotification);
+        values[3].setText(juce::String((int)proc.value("mix"))+"%",juce::dontSendNotification);
+        const int current=juce::jlimit(0,3,(int)std::round(proc.value("mode")));
+        for(int i=0;i<4;++i)
+            modesUI[(size_t)i].setToggleState(current==i,juce::dontSendNotification);
+    }
+    void timerCallback() override {syncUI();}
+    PrioraProcessor& proc;
+    PrioraLookAndFeel skin;
+    juce::Image car;
+    std::array<juce::Slider,4> controls;
+    std::array<juce::Label,4> values;
+    std::array<juce::TextButton,4> modesUI;
+    std::array<std::unique_ptr<APVTS::SliderAttachment>,4> attaches;
+};
+
+juce::AudioProcessorEditor* PrioraProcessor::createEditor() {return new PrioraEditor(*this);}
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new PrioraProcessor();}
