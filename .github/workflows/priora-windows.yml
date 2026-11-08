@@ -1,0 +1,57 @@
+name: Build Priora Bus Bust05 Windows installer
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'PrioraBusBust05/**'
+      - '.github/workflows/priora-windows.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore artwork from embedded repository asset
+        shell: pwsh
+        run: |
+          $b64 = (Get-Content "PrioraBusBust05/Resources/background.jpg.base64" -Raw).Trim()
+          [IO.File]::WriteAllBytes("PrioraBusBust05/Resources/background.jpg",[Convert]::FromBase64String($b64))
+      - name: Configure JUCE project
+        shell: pwsh
+        run: cmake -S PrioraBusBust05 -B PrioraBusBust05/build -G "Visual Studio 17 2022" -A x64
+      - name: Build VST3
+        shell: pwsh
+        run: cmake --build PrioraBusBust05/build --config Release --target PrioraBusBust05_VST3 --parallel 4
+      - name: Verify plugin binary
+        shell: pwsh
+        run: |
+          $f = "PrioraBusBust05/build/PrioraBusBust05_artefacts/Release/VST3/Priora Bus Bust05 by DJ Begemot.vst3/Contents/x86_64-win/Priora Bus Bust05 by DJ Begemot.vst3"
+          if (!(Test-Path $f)) {
+            Get-ChildItem -Recurse PrioraBusBust05/build/PrioraBusBust05_artefacts/Release/VST3 | Select-Object FullName
+            throw "VST3 binary missing"
+          }
+      - name: Build Windows installer
+        shell: pwsh
+        working-directory: PrioraBusBust05
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (!(Test-Path $iscc)) { throw "Inno Setup was not installed" }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) {throw "Installer compilation failed"}
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Priora-Bus-Bust05-Windows-Installer
+          path: PrioraBusBust05/dist/Priora_Bus_Bust05_by_DJ_Begemot_Setup.exe
+          if-no-files-found: error
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: Priora-Bus-Bust05-VST3
+          path: PrioraBusBust05/build/PrioraBusBust05_artefacts/Release/VST3/Priora Bus Bust05 by DJ Begemot.vst3/**
+          if-no-files-found: error
