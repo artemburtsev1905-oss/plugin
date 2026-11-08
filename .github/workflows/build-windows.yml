@@ -1,0 +1,49 @@
+name: Build Windows VST3 and Installer
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure JUCE project
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+      - name: Build VST3
+        shell: pwsh
+        run: cmake --build build --config Release --target VocalAutoAssistant_VST3 --parallel 4
+      - name: Verify VST3 bundle
+        shell: pwsh
+        run: |
+          $folder = "build\VocalAutoAssistant_artefacts\Release\VST3\Vocal Auto Assistant.vst3"
+          if (!(Test-Path "$folder\Contents\x86_64-win\Vocal Auto Assistant.vst3")) {
+            Get-ChildItem -Recurse build\VocalAutoAssistant_artefacts\Release\VST3 | Select-Object FullName
+            throw "Compiled VST3 binary not found"
+          }
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          if (!(Test-Path $iscc)) { throw "ISCC not available" }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed" }
+      - name: Upload downloadable Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vocal-Auto-Assistant-Windows-Installer
+          path: dist/Vocal_Auto_Assistant_Setup_Windows.exe
+          if-no-files-found: error
+      - name: Upload VST3 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vocal-Auto-Assistant-VST3
+          path: build/VocalAutoAssistant_artefacts/Release/VST3/Vocal Auto Assistant.vst3/**
+          if-no-files-found: error
